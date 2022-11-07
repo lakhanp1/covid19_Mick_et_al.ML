@@ -1,0 +1,552 @@
+---
+title: "Exploring Mick Eran et al (2022) gene expression data for COVID-19 prediction"
+author: Lakhansing Pardeshi, Wageningen University & Research
+output: html_document
+date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = TRUE, results = 'markup', warning = FALSE, strip.white = TRUE,
+  message = FALSE)
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(magrittr))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(tidymodels))
+suppressPackageStartupMessages(library(glmnet))
+suppressPackageStartupMessages(library(corrplot))
+suppressPackageStartupMessages(library(matrixStats))
+suppressPackageStartupMessages(library(factoextra))
+suppressPackageStartupMessages(library(FactoMineR))
+suppressPackageStartupMessages(library(recipeselectors))
+suppressPackageStartupMessages(library(FSelectorRcpp))
+
+
+rm(list = ls())
+
+set.seed(124)
+
+file_geneCounts <- here::here("data", "swab_gene_counts.csv")
+file_meta <- here::here("data", "metatable_with_viral_status.csv")
+file_gene2Name <- here::here("data/annotation", "gene2name.txt")
+
+pt_theme <- theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 12, color = "black"),
+    plot.title = element_text(face = "bold", size = 14, color = "black"),
+    axis.title = element_text(face = "bold", size = 13, color = "black")
+  )
+
+```
+
+## Preprocessing
+
+```{r}
+
+sampleInfo <- suppressMessages(readr::read_csv(file = file_meta)) %>% 
+  dplyr::rename(sampleId = CZB_ID) %>% 
+  dplyr::mutate(
+    class = dplyr::case_when(
+      viral_status == "SC2" ~ "positive",
+      viral_status == "no_virus" ~ "negative",
+      viral_status == "other_virus" ~ "negative",
+      TRUE ~ NA_character_
+    ),
+    viral_status = forcats::fct_relevel(
+      .f = viral_status, "SC2", "no_virus", "other_virus"
+    ),
+    class = forcats::fct_relevel(
+      .f = class, "positive", "negative"
+    )
+  )
+
+metadataCols <- setdiff(colnames(sampleInfo), "class")
+
+covidData <- suppressMessages(readr::read_csv(file = file_geneCounts)) %>% 
+  dplyr::rename(geneId = "...1") %>% 
+  tidyr::pivot_longer(cols = !geneId, names_to = "sampleId", values_to = "count") %>% 
+  tidyr::pivot_wider(names_from = geneId, values_from = count) %>% 
+  dplyr::left_join(y = sampleInfo, by = "sampleId") %>% 
+  dplyr::select(class, !!!metadataCols, everything())
+
+gene2Name <- suppressMessages(
+  readr::read_tsv(
+    file = file_gene2Name, col_names = c("geneId", "geneName"), col_select = 1:2
+  )
+)
+
+nFeatures <- ncol(covidData) - ncol(sampleInfo)
+nSamples <- nrow(covidData)
+
+```
+
+The current dataset has `r length(unique(sampleInfo$viral_status))` categories of
+patients. 
+
+```{r}
+levels(sampleInfo$viral_status)
+```
+
+However, to simplify the prediction task, `no_virus` and `other_virus`
+categories were merged into `negative` category and `SC2` category samples are used
+as `positive` category samples.
+
+```{r}
+levels(sampleInfo$class)
+```
+
+### Data summary
+
+```{r}
+
+pt_stats <- ggplot(
+  data = sampleInfo,
+  mapping = aes(x = viral_status, fill = gender)
+) +
+  geom_bar(
+    stat = "count"
+  ) +
+  geom_text(
+    mapping = aes(label = ..count..), stat = "count",
+    position = position_stack(vjust = 0.5),
+    color = "black", size = 6, fontface = "bold"
+  ) +
+  labs(title = "Class distribution of data") +
+  scale_fill_manual(
+    values = c("F" = "#F06C9B", "M" = "#61A0AF")
+  ) +
+  scale_x_discrete(
+    labels = dplyr::count(sampleInfo, viral_status) %>% 
+      dplyr::mutate(label = paste(viral_status, "\n(", n, ")", sep = "")) %>% 
+      dplyr::pull(var = label, name = viral_status)
+  ) +
+  pt_theme
+
+pt_stats
+
+```
+
+### Normalize raw counts: DESeq2 `vst()`
+
+```{r, results='hide'}
+countMat <- dplyr::select(covidData, -class, -!!metadataCols) %>% 
+  as.matrix()
+
+rownames(countMat) <- covidData$sampleId
+
+## rlog transformation is very time consuming
+# dds <- DESeq2::DESeqDataSetFromMatrix(
+#     countData = as.matrix(t(countMat)),
+#     colData = sampleInfo,
+#     design = ~1
+#   )
+# 
+# ## r-log normalized counts
+# rld <- rlog(dds, blind = FALSE)
+# rldCount <- rownames_to_column(as.data.frame(assay(rld)), var = "geneId")
+#
+
+normCountMat <- DESeq2::varianceStabilizingTransformation(t(countMat))
+
+
+```
+
+### Exploring data using PCA
+
+For PCA analysis, top 2000 genes showing highest variation are selected.
+
+```{r}
+## select top 2000 rows/genes with highest variation
+rv <- matrixStats::rowVars(normCountMat)
+keep <- order(rv, decreasing=TRUE)[seq_len(min(2000, length(rv)))]
+
+## remove low count rows
+# keep<- rowSums(normCountMat > 1) >= 2
+
+normCountMatFiltered <- normCountMat[keep, ]
+
+pcaData <- tibble::as_tibble(t(normCountMatFiltered), rownames = "sampleId") %>% 
+  dplyr::left_join(y = sampleInfo, by = "sampleId") %>% 
+  dplyr::select(class, !!!metadataCols, everything()) %>% 
+  as.data.frame()
+
+row.names(pcaData) <- pcaData$sampleId
+
+res.pca <- FactoMineR::PCA(
+  X = pcaData, graph = FALSE, scale.unit = TRUE,
+  quali.sup = 1:ncol(sampleInfo), ncp = 10
+)
+
+eig.val <- factoextra::get_eigenvalue(res.pca)
+
+## Graph of individuals
+ind <- factoextra::get_pca_ind(res.pca)
+var <- factoextra::get_pca_var(res.pca)
+```
+
+Scree plot showing percentage of the explained variance by top 10 PCs.
+
+```{r}
+## scree plot: variance by PC
+factoextra::fviz_eig(res.pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+First two PCs explain `r eig.val[2, "cumulative.variance.percent"]`% variance in
+the data. Top 10 PCs explain `r eig.val[10, "cumulative.variance.percent"]`% variance
+in the data. Out of `r nrow(eig.val)` PCs, 
+`r length(which(eig.val[, "cumulative.variance.percent"] <= 80))` are required to
+explain the 80% variance in the current data.
+
+```{r}
+as.data.frame(eig.val) %>% 
+  tibble::rownames_to_column(var = "pc") %>% 
+  dplyr::mutate(dim = 1:n()) %>% 
+  dplyr::filter(cumulative.variance.percent <= 80) %>% 
+  # dplyr::slice(1:20) %>%
+  ggplot2::ggplot(
+    mapping = aes(x = dim, y = cumulative.variance.percent)
+  ) +
+  geom_point() +
+  geom_line() +
+  labs(
+    x = "Dimensions",
+    y = "% variance explained by PCs",
+    title = "Cumulative variance of PCs"
+  ) +
+  pt_theme
+```
+
+
+Projection of samples on PC1 and PC2 does not result into clear clustering of samples
+with respect viral status.
+
+```{r}
+factoextra::fviz_pca_ind(
+  X = res.pca,
+  fill.ind = sampleInfo$viral_status,
+  pointshape = 21,
+  repel = TRUE,
+  mean.point = FALSE,
+  geom = c("point"),
+  legend.title = "Study",
+  pointsize = 2
+)
+```
+
+Exploring additional PCs also leads to the same observations.
+
+```{r}
+## prepare the plot dataframe for ggplot
+plotData <- as.data.frame(ind$coord) %>%
+  tibble::rownames_to_column(var = "sampleId") %>%
+  dplyr::left_join(y = sampleInfo, by = c("sampleId" = "sampleId"))
+
+pairs(
+  x = plotData[, 2:6],
+  pch = 19,  cex = 1,
+  col = plotData$viral_status,
+  lower.panel=NULL
+)
+```
+
+Based on the above results, unsupervised linear feature extraction using PCA is
+not sufficient to cluster the samples into different categories. In next steps,
+we will attempt to use the PCA as one of the feature extraction methods for building
+prediction model.
+
+
+
+
+## Machine Learning setup
+
+### Data processing flowchart
+
+```{r}
+## use nomnoml package to show UML
+```
+
+### Data splitting and resampling
+
+20% data is held outside and 80% data will be used for modelling purpose using 5
+fold crossvalidation. This holdout dataset will be used to evaluate the final
+optimized model. Optimized models of multiple learners will be evaluated against
+this holdout set to select the best performing learner.
+
+```{r}
+splits <- rsample::initial_split(data = covidData, prop = 4/5, strata = viral_status)
+
+dataHoldout <- rsample::testing(splits)
+dataModelling <- rsample::training(splits)
+
+folds <- rsample::vfold_cv(
+  data = dataModelling, v = 5, strata = viral_status
+)
+
+# rsample::analysis(x = folds$splits[[1]])
+# rsample::assessment(x = folds$splits[[1]])
+
+```
+
+### Variance stalilizing transformation (VST) from DESeq2 package as a recipe
+
+The gene expression raw counts will be normalized using variance stabilizing 
+transformation (VST) methods of `DESeq2` package. This transformation will result
+into library size normalized count matrix with constant variance along the range
+of mean values. VST transformation will be applied to the training set. Dispersion
+estimates for Negative Binomial distributed training data will be calculated using
+`DESeq2::estimateDispersions()` function and these dispersions will be applied to
+the test data. Please refer to `DESeq2` manual for additional details.
+
+
+To process the training data for each fold and its respective test fold, we will
+build a custom VST normalization recipe. The following code block constructs
+`step_deseq2_vst` recipe.
+
+```{r}
+## Create the function
+step_deseq2_vst <- function(
+    recipe, 
+    ..., 
+    role = NA, 
+    trained = FALSE, 
+    dispersionFn = NULL,
+    geneIds = NULL,
+    options = list(blind = TRUE, fitType = "parametric"),
+    skip = FALSE,
+    id = recipes::rand_id("DESeq2_vst")
+) {
+  
+  # dispersionFn: this variable will store the dispersion function calculated
+  # from the training set in prep() and will be applied to new dataset in bake()
+  
+  ## The variable selectors are not immediately evaluated by using
+  ##  the `quos()` function in `rlang`. `ellipse_check()` captures 
+  ##  the values and also checks to make sure that they are not empty.  
+  terms <- ellipse_check(...) 
+  
+  recipes::add_step(
+    recipe, 
+    step_deseq2_vst_new(
+      terms = terms, 
+      trained = trained,
+      role = role, 
+      dispersionFn = dispersionFn,
+      geneIds = geneIds,
+      options = options,
+      skip = skip,
+      id = id
+    )
+  )
+  
+}
+
+## Initialize a new object
+step_deseq2_vst_new <- function(terms, role, trained, dispersionFn, geneIds, options, skip, id) {
+  recipes::step(
+    subclass = "deseq2_vst", 
+    terms = terms,
+    role = role,
+    trained = trained,
+    dispersionFn = dispersionFn,
+    geneIds = geneIds,
+    options = options,
+    skip = skip,
+    id = id
+  )
+}
+
+
+## Create the prep method
+#' @export
+prep.step_deseq2_vst <- function(x, training, info = NULL, ...) {
+  ## Remember that the prep() function does not apply the step to the data;
+  ## it only estimates any required values 
+  col_names <- recipes::recipes_eval_select(x$terms, training, info)
+  recipes::check_type(training[, col_names])
+  
+  ## use col_names to ensure the same column order for the data
+  ## compute the dispersion function from the training data
+  dds_train <- DESeq2::DESeqDataSetFromMatrix(
+    countData = as.matrix(t(training[, col_names])),
+    colData = DataFrame(condition = rep("A", nrow(training))),
+    design = ~1
+  )
+  dds_train <- DESeq2::estimateSizeFactors(dds_train)
+  dds_train <- DESeq2::estimateDispersions(dds_train)
+  
+  dispersionFn <- DESeq2::dispersionFunction(dds_train)
+  
+  ## Use the constructor function to return the updated object. 
+  ## Note that `trained` is now set to TRUE
+  ## dispersionFn: has the dispersion function from training data
+  step_deseq2_vst_new(
+    terms = x$terms,
+    role = x$role,
+    trained = TRUE,
+    dispersionFn = dispersionFn,
+    geneIds = col_names,
+    options = x$options,
+    skip = x$skip,
+    id = x$id
+  )
+}
+
+
+## Create the bake method
+bake.step_deseq2_vst <- function(object, new_data, ...) {
+  # object: updated step function that has been through the corresponding prep() code
+  # new_data: tibble of data to be processed. 
+  # return: a tibble of the modified version of new_data
+  
+  ## use col_names to ensure the same column order for the data
+  col_names <- object$geneIds
+  
+  recipes::check_new_data(col_names, object, new_data)
+  
+  dds_newData <- DESeq2::DESeqDataSetFromMatrix(
+    countData = as.matrix(t(new_data[, col_names])),
+    colData = DataFrame(condition = rep("A", nrow(new_data))),
+    design = ~1
+  )
+  
+  dds_newData <- DESeq2::estimateSizeFactors(dds_newData)
+  
+  ## apply dispersion function from obtained from the training data
+  DESeq2::dispersionFunction(dds_newData) <- object$dispersionFn
+  
+  ## normalize the data
+  vstCall <- expr(
+    DESeq2::varianceStabilizingTransformation(
+      object = dds_newData,
+      !!!object$options
+    )
+  )
+  
+  vst <- eval(vstCall)
+  
+  normCounts <- tibble::as_tibble(t(assay(vst)))
+  
+  ## replace the count data with normalized data
+  new_data[, col_names] <- normCounts[, col_names]
+  
+  new_data
+}
+```
+
+### Data preprocessing setup
+
+#### Define column roles and raw count normalization
+
+A basic recipe is created which involves assigning the predictor and outcome roles
+to the variables and counts data normalization.
+
+```{r}
+cores <- parallel::detectCores()
+cores <- 4
+
+## basic recipe for count normalization
+rec_vst <- recipes::recipe(x = dataModelling) %>% 
+  recipes::update_role(tidyselect::everything(), new_role = "predictor") %>% 
+  recipes::update_role(class, new_role = "outcome") %>% 
+  recipes::update_role(!!!syms(metadataCols), new_role = "ID") %>% 
+  step_deseq2_vst(recipes::all_predictors())
+
+## test if recipe works: verified
+preped_rec_vst <- recipes::prep(
+  x = rec_vst,
+  training = rsample::analysis(x = folds$splits[[1]])
+  )
+
+test_baked_vst <- recipes::bake(
+  object = preped_rec_vst,
+  new_data = rsample::assessment(x = folds$splits[[1]])
+)
+```
+
+We will use two feature selection methods, **information gain** and **glmnet**.
+`rec_vst` will be extended to include the feature selection step for each of these
+methods.
+
+#### Feature selection recipe: information gain
+
+```{r}
+## feature selection recipe using information gain 
+rec_infgain <- rec_vst %>% 
+  recipeselectors::step_select_infgain(
+    recipes::all_predictors(), outcome = "class",  
+    type = "infogain", threads = cores, top_p = 50
+  )
+
+# ## test if recipe works
+# preped_rec_infgain <- recipes::prep(
+#   x = rec_infgain,
+#   training = rsample::analysis(x = folds$splits[[1]])
+# )
+# 
+# train_baked_infgain <- recipes::bake(
+#   object = preped_rec_infgain,
+#   new_data = rsample::analysis(x = folds$splits[[1]])
+# )
+
+```
+
+#### Feature selection recipe: LASSO
+
+In the next steps, we will select the model and engine for prediction task. We will
+be applying three ML methods on our data; Random Forests, Support Vector Machines
+and Gradient Boost and select the best method after performance evaluation.
+
+### Random Forest
+
+```{r}
+## random forest model
+mod_rf <- parsnip::rand_forest(
+  trees = 10000,
+  mtry = tune(), min_n = tune()
+) %>% 
+  parsnip::set_engine("ranger", num.threads = cores) %>% 
+  parsnip::set_mode("classification")
+
+## grid for optimum hyperparameter search
+grid_rf <- dials::grid_regular(
+  dials::mtry(range = c(1L, 10L)),
+  dials::min_n(range = c(2L, 40L)),
+  levels = 5
+)
+
+```
+
+#### Random Forests with information gain based feature selection
+
+```{r}
+## random forest workflow
+workflow_rf_inf <- workflows::workflow() %>% 
+  workflows::add_model(mod_rf) %>% 
+  workflows::add_recipe(rec_infgain)
+
+# rsample::analysis(x = folds$splits[[1]])
+# rsample::assessment(x = folds$splits[[1]])
+
+# res_rf_inf <- workflow_rf_inf %>% 
+#   tune::tune_grid(
+#     resamples = folds,
+#     grid = grid_rf
+#   )
+# 
+# tune::collect_metrics(res_rf_inf)
+# tune::show_best(res_rf_inf)
+# tune::select_best(res_rf_inf)
+```
+
+
+### Correlation between most informative features
+
+### SVM
+
+### Gradient boost
+
+
+
