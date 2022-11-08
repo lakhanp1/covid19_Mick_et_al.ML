@@ -5,7 +5,7 @@ fit_store_best_model <- function(
     tune_res, outPrefix, label, truth_col, pred_cols, wf = NULL, evalSplits = NULL
 ){
   ## select best
-  bestModel <- tune::select_best(tune_res, metric = "roc_auc")
+  bestModel <- tune::show_best(tune_res, metric = "roc_auc", n = 1)
   readr::write_tsv(
     x = bestModel, file = paste(outPrefix, ".best_model.tsv", sep = "")
   )
@@ -24,7 +24,7 @@ fit_store_best_model <- function(
     finalWf <- tune::finalize_workflow(x = wf, parameters = bestModel)
     finalFit <- tune::last_fit(object = finalWf, split = evalSplits)
     
-    collect_metrics(lasso_pca_holdFit) %>% 
+    collect_metrics(finalFit) %>% 
       readr::write_tsv(file = paste(outPrefix, ".final_prediction.tsv", sep = ""))
   }
   
