@@ -41,6 +41,13 @@ pt_theme <- theme_bw() +
     axis.title = element_text(face = "bold", size = 13, color = "black")
   )
 
+cores <- parallel::detectCores()
+cores <- 4
+
+# cl <- makePSOCKcluster(cores)
+# doParallel::registerDoParallel(cl)
+# stopCluster(cl)
+
 ```
 
 ## Preprocessing
@@ -263,15 +270,6 @@ prediction model.
 
 ## Machine Learning setup
 
-```{r}
-cores <- parallel::detectCores()
-cores <- 4
-
-# cl <- makePSOCKcluster(cores)
-# doParallel::registerDoParallel(cl)
-# stopCluster(cl)
-```
-
 
 ### Data processing flowchart
 
@@ -455,6 +453,22 @@ A basic recipe is created which involves assigning the predictor and outcome rol
 to the variables and counts data normalization using VST.
 
 ```{r}
+## a utliity function to test if a recipe works as expected
+check_if_recipe_cooks <- function(rcp){
+  preped_rec <- recipes::prep(
+    x = rcp,
+    training = rsample::analysis(x = folds$splits[[1]])
+  )
+  
+  test_baked <- recipes::bake(
+    object = preped_rec,
+    new_data = rsample::assessment(x = folds$splits[[1]])
+  )
+  
+  return(test_baked)
+}
+
+
 ## basic recipe for count normalization
 rec_vst <- recipes::recipe(x = dataModelling) %>% 
   recipes::update_role(tidyselect::everything(), new_role = "predictor") %>% 
@@ -462,20 +476,7 @@ rec_vst <- recipes::recipe(x = dataModelling) %>%
   recipes::update_role(!!!syms(metadataCols), new_role = "ID") %>% 
   step_deseq2_vst(recipes::all_predictors())
 
-# ## test if recipe works: verified
-# preped_rec_vst <- recipes::prep(
-#   x = rec_vst,
-#   training = rsample::analysis(x = folds$splits[[1]])
-#   )
-# 
-# test_baked_vst <- recipes::bake(
-#   object = preped_rec_vst,
-#   new_data = rsample::assessment(x = folds$splits[[1]])
-# )
-
-## save the out-of-sample predictions for each model evaluated during tuning step
-gridControl <- tune::control_grid(save_pred = TRUE)
-
+# cooked_rcp <- check_if_recipe_cooks(rcp = rec_vst)
 ```
 
 We will use two feature selection methods, **information gain** and **glmnet** and
@@ -495,17 +496,7 @@ infogain_rec <- rec_vst %>%
     type = "infogain", threads = !!cores, top_p = 50
   )
 
-# ## test if recipe works
-# preped_rec_infgain <- recipes::prep(
-#   x = infogain_rec,
-#   training = rsample::analysis(x = folds$splits[[1]])
-# )
-# 
-# train_baked_infgain <- recipes::bake(
-#   object = preped_rec_infgain,
-#   new_data = rsample::analysis(x = folds$splits[[1]])
-# )
-
+# cooked_rcp <- check_if_recipe_cooks(rcp = infogain_rec)
 ```
 
 #### Feature extraction recipe: PCA
@@ -520,48 +511,48 @@ pca_rec <- rec_vst %>%
     recipes::all_predictors(), threshold = 0.8
   )
 
-# ## test if recipe works
-# preped_rec_pca <- recipes::prep(
-#   x = pca_rec,
-#   training = rsample::analysis(x = folds$splits[[1]])
-# )
-# 
-# train_baked_pca <- recipes::bake(
-#   object = preped_rec_pca,
-#   new_data = rsample::analysis(x = folds$splits[[1]])
-# )
-
+# cooked_rcp <- check_if_recipe_cooks(rcp = pca_rec)
 ```
 
-#### Feature selection recipe: LASSO
 
-LASSO Regularized Generalized Linear Models will be used on the trimmed feature
-set generated after entropy based feature selection. This should reduce the time
-required for model optimization.
+#### Other convenience functions
 
 ```{r}
-lasso_rec <- rec_vst %>% 
-  recipeselectors::step_select_infgain(
-    recipes::all_predictors(), outcome = "class",  
-    type = "infogain", threads = !!cores, threshold = 0.99
-  ) %>% 
-  recipeselectors::step_select_linear(
-    recipes::all_predictors(), outcome = "class", engine = "glmnet",
-    mixture = 1, ## implies lasso
-    threshold = 0.999,
-    penalty = tune()
+## a generic function to
+## 1) extract the best performing from hyperparameter tuning results
+## 2) store the AUC data and hyperparameters for best model
+## 3) fit the best model to initial_split and save performance for holdout test data 
+fit_store_best_model <- function(
+    tune_res, outPrefix, label, truth_col, pred_cols, wf = NULL, evalSplits = NULL
+){
+  ## select best
+  bestModel <- tune::select_best(tune_res, metric = "roc_auc")
+  readr::write_tsv(
+    x = bestModel, file = paste(outPrefix, ".best_model.tsv", sep = "")
   )
-
-# ## test if recipe works
-# preped_rec_lasso <- recipes::prep(
-#   x = lasso_rec,
-#   training = rsample::analysis(x = folds$splits[[1]])
-# )
-# 
-# train_baked_lasso <- recipes::bake(
-#   object = preped_rec_lasso,
-#   new_data = rsample::analysis(x = folds$splits[[1]])
-# )
+  
+  ## store AUC
+  aucDf <- tune::collect_predictions(x = tune_res, parameters = bestModel) %>% 
+    yardstick::roc_curve(!!truth_col, !!!pred_cols) %>%
+    dplyr::mutate(model = label)
+  
+  readr::write_tsv(x = aucDf, file = paste(outPrefix, ".auc.tsv", sep = ""))
+  
+  finalFit <- NULL
+  
+  ## fit to initial_split
+  if(!is.null(evalSplits) && !is.null(wf)){
+    finalWf <- tune::finalize_workflow(x = wf, parameters = bestModel)
+    finalFit <- tune::last_fit(object = finalWf, split = evalSplits)
+    
+    collect_metrics(lasso_pca_holdFit) %>% 
+      readr::write_tsv(file = paste(outPrefix, ".final_prediction.tsv", sep = ""))
+  }
+  
+  return(
+    list(bestModel = bestModel, auc = aucDf, finalFit = finalFit)
+  )
+}
 
 ```
 
@@ -590,18 +581,11 @@ rf_grid <- dials::grid_regular(
   levels = 5
 )
 
-rf_lasso_grid <- dials::grid_regular(
-  dials::mtry(range = c(1L, 10L)),
-  dials::min_n(range = c(2L, 40L)),
-  dials::penalty(),
-  levels = 5
-)
-
 ```
 
 #### PCA with Random Forest
 
-```{r}
+```{r eval=FALSE}
 ## random forest workflow
 rf_pca_workflow <- workflows::workflow() %>% 
   workflows::add_model(rf_mod) %>% 
@@ -622,28 +606,11 @@ rf_pca_res <- rf_pca_workflow %>%
 # tune::collect_metrics(rf_pca_res)
 # tune::show_best(rf_pca_res)
 
-## select hyperparameters of the best performing model
-rf_pca_best <- tune::select_best(rf_pca_res, metric = "roc_auc")
-
-## calculate and save AUC data for future use
-rf_pca_auc <- tune::collect_predictions(x = rf_pca_res, parameters = rf_pca_best) %>% 
-  yardstick::roc_curve(class, .pred_positive) %>% 
-  dplyr::mutate(model = "PCA + Random Forest")
-
-readr::write_tsv(
-  x = rf_pca_auc, file = here::here("data/results", "rf_pca.auc.tsv")
-)
-
-## finalize the workflow with best hyperparameters
-rf_pca_final <- rf_pca_workflow %>% 
-  tune::finalize_workflow(rf_pca_best)
-
-rf_pca_holdFit <- rf_pca_final %>% 
-  tune::last_fit(split = splits)
-
-collect_metrics(rf_pca_holdFit) %>% 
-  readr::write_tsv(
-    file = here::here("data/results", "rf_pca.final_prediction.tsv")
+rf_pca_best <- fit_store_best_model(
+  tune_res = rf_pca_res,
+  outPrefix = "rf_pca", label = "PCA + Random Forest",
+  truth_col = "class", pred_cols = ".pred_positive",
+  wf = rf_pca_workflow, evalSplits = splits
   )
 
 ```
@@ -651,13 +618,14 @@ collect_metrics(rf_pca_holdFit) %>%
 
 #### Information gain with Random Forest 
 
-```{r}
+```{r eval=FALSE}
 ## random forest workflow
 rf_info_workflow <- workflows::workflow() %>% 
   workflows::add_model(rf_mod) %>% 
   workflows::add_recipe(infogain_rec)
 
-# doParallel::registerDoParallel(cores = 4)
+# registerDoParallel(cores=4)  
+# cl <- makeCluster(4, type="FORK")  
 
 rf_info_res <- rf_info_workflow %>% 
   tune::tune_grid(
@@ -667,80 +635,19 @@ rf_info_res <- rf_info_workflow %>%
     metrics = metric_set(roc_auc)
   )
 
-# stopImplicitCluster()
+# stopCluster(cl)
 
 # tune::collect_metrics(rf_info_res)
 # tune::show_best(rf_info_res)
 
 ## select hyperparameters of the best performing model
-rf_info_best <- tune::select_best(rf_info_res, metric = "roc_auc")
-
-## calculate and save AUC data for future use
-rf_info_auc <- tune::collect_predictions(x = rf_info_res, parameters = rf_info_best) %>% 
-  yardstick::roc_curve(class, .pred_positive) %>% 
-  dplyr::mutate(model = "Information Gain + Random Forest")
-
-readr::write_tsv(
-  x = rf_info_auc, file = here::here("data/results", "rf_info.auc.tsv")
-)
-
-
-## finalize the workflow with best hyperparameters
-rf_info_final <- rf_info_workflow %>% 
-  tune::finalize_workflow(rf_info_best)
-
-rf_info_holdFit <- rf_info_final %>% 
-  tune::last_fit(split = splits)
-
-collect_metrics(rf_info_holdFit) %>% 
-  readr::write_tsv(
-    file = here::here("data/results", "rf_info.final_prediction.tsv")
-  )
-```
-
-#### Lasso with Random Forest
-
-```{r}
-## random forest workflow
-rf_lasso_workflow <- workflows::workflow() %>% 
-  workflows::add_model(rf_mod) %>% 
-  workflows::add_recipe(lasso_rec)
-
-rf_lasso_res <- rf_lasso_workflow %>% 
-  tune::tune_grid(
-    resamples = folds,
-    grid = rf_lasso_grid,
-    control = control_grid(save_pred = TRUE),
-    metrics = metric_set(roc_auc)
+rf_info_best <- fit_store_best_model(
+  tune_res = rf_info_res,
+  outPrefix = "rf_info", label = "Information Gain + Random Forest",
+  truth_col = "class", pred_cols = ".pred_positive",
+  wf = rf_info_workflow, evalSplits = splits
   )
 
-# tune::collect_metrics(rf_lasso_res)
-# tune::show_best(rf_lasso_res)
-
-## select hyperparameters of the best performing model
-rf_lasso_best <- tune::select_best(rf_lasso_res, metric = "roc_auc")
-
-## calculate and save AUC data for future use
-rf_lasso_auc <- tune::collect_predictions(x = rf_lasso_res, parameters = rf_lasso_best) %>% 
-  yardstick::roc_curve(class, .pred_positive) %>% 
-  dplyr::mutate(model = "Lasso + Random Forest")
-
-readr::write_tsv(
-  x = rf_lasso_auc, file = here::here("data/results", "rf_lasso.auc.tsv")
-)
-
-
-## finalize the workflow with best hyperparameters
-rf_lasso_final <- rf_lasso_workflow %>% 
-  tune::finalize_workflow(rf_lasso_best)
-
-rf_lasso_holdFit <- rf_lasso_final %>% 
-  tune::last_fit(split = splits)
-
-collect_metrics(rf_lasso_holdFit) %>% 
-  readr::write_tsv(
-    file = here::here("data/results", "rf_lasso.final_prediction.tsv")
-  )
 ```
 
 
@@ -761,18 +668,11 @@ svm_grid <- dials::grid_regular(
   levels = 5
 )
 
-svm_lasso_grid <- dials::grid_regular(
-  dials::cost(),
-  dials::rbf_sigma(),
-  dials::penalty(),
-  levels = 5
-)
-
 ```
 
 #### PCA with SVM
 
-```{r}
+```{r eval=FALSE}
 ## SVM workflow
 svm_pca_workflow <- workflows::workflow() %>% 
   workflows::add_model(svm_mod) %>% 
@@ -794,33 +694,18 @@ svm_pca_res <- svm_pca_workflow %>%
 # tune::show_best(svm_pca_res)
 
 ## select hyperparameters of the best performing model
-svm_pca_best <- tune::select_best(svm_pca_res, metric = "roc_auc")
-
-## calculate and save AUC data for future use
-svm_pca_auc <- tune::collect_predictions(x = svm_pca_res, parameters = svm_pca_best) %>% 
-  yardstick::roc_curve(class, .pred_positive) %>% 
-  dplyr::mutate(model = "PCA + SVM")
-
-readr::write_tsv(
-  x = svm_pca_auc, file = here::here("data/results", "svm_pca.auc.tsv")
-)
-
-## finalize the workflow with best hyperparameters
-svm_pca_final <- svm_pca_workflow %>% 
-  tune::finalize_workflow(svm_pca_best)
-
-svm_pca_holdFit <- svm_pca_final %>% 
-  tune::last_fit(split = splits)
-
-collect_metrics(svm_pca_holdFit) %>% 
-  readr::write_tsv(
-    file = here::here("data/results", "svm_pca.final_prediction.tsv")
+svm_pca_best <- fit_store_best_model(
+  tune_res = svm_pca_res,
+  outPrefix = "svm_pca", label = "PCA + SVM",
+  truth_col = "class", pred_cols = ".pred_positive",
+  wf = svm_pca_workflow, evalSplits = splits
   )
+
 ```
 
 #### Information gain with SVM
 
-```{r}
+```{r eval=FALSE}
 ## SVM workflow
 svm_info_workflow <- workflows::workflow() %>% 
   workflows::add_model(svm_mod) %>% 
@@ -838,83 +723,140 @@ svm_info_res <- svm_info_workflow %>%
 # tune::show_best(svm_info_res)
 
 ## select hyperparameters of the best performing model
-svm_info_best <- tune::select_best(svm_info_res, metric = "roc_auc")
-
-## calculate and save AUC data for future use
-svm_info_auc <- tune::collect_predictions(x = svm_info_res, parameters = svm_info_best) %>% 
-  yardstick::roc_curve(class, .pred_positive) %>% 
-  dplyr::mutate(model = "Information Gain + SVM")
-
-readr::write_tsv(
-  x = svm_info_auc, file = here::here("data/results", "svm_info.auc.tsv")
-)
-
-## finalize the workflow with best hyperparameters
-svm_info_final <- svm_info_workflow %>% 
-  tune::finalize_workflow(svm_info_best)
-
-svm_info_holdFit <- svm_info_final %>% 
-  tune::last_fit(split = splits)
-
-collect_metrics(svm_info_holdFit) %>% 
-  readr::write_tsv(
-    file = here::here("data/results", "svm_info.final_prediction.tsv")
+svm_info_best <- fit_store_best_model(
+  tune_res = svm_info_res,
+  outPrefix = "svm_info", label = "Information Gain + SVM",
+  truth_col = "class", pred_cols = ".pred_positive",
+  wf = svm_info_workflow, evalSplits = splits
   )
+
 ```
 
 
-#### Lasso with SVM
+### Lasso logistic regression
 
 ```{r}
-## SVM workflow
-svm_lasso_workflow <- workflows::workflow() %>% 
-  workflows::add_model(rf_mod) %>% 
-  workflows::add_recipe(lasso_rec)
+## logistic regression: Lasso
+lasso_mod <- parsnip::logistic_reg(
+  mixture = 1, penalty = tune()
+) %>% 
+  parsnip::set_engine("glmnet") %>% 
+  parsnip::set_mode("classification")
 
-svm_lasso_res <- svm_lasso_workflow %>% 
+## grid for optimum hyperparameter search
+lasso_grid <- dials::grid_regular(
+  dials::penalty(),
+  levels = 10
+)
+```
+
+
+#### PCA with Lasso
+
+``` {r eval=FALSE}
+lasso_pca_workflow <- workflows::workflow() %>% 
+  workflows::add_model(lasso_mod) %>% 
+  workflows::add_recipe(pca_rec)
+
+# doParallel::registerDoParallel(cores = 4)
+
+lasso_pca_res <- lasso_pca_workflow %>% 
   tune::tune_grid(
     resamples = folds,
-    grid = svm_lasso_grid,
+    grid = lasso_grid,
     control = control_grid(save_pred = TRUE),
     metrics = metric_set(roc_auc)
   )
 
-# tune::collect_metrics(svm_lasso_res)
-# tune::show_best(svm_lasso_res)
+# stopImplicitCluster()
+
+# tune::collect_metrics(lasso_pca_res)
+# tune::show_best(lasso_pca_res)
 
 ## select hyperparameters of the best performing model
-svm_lasso_best <- tune::select_best(svm_lasso_res, metric = "roc_auc")
-
-## calculate and save AUC data for future use
-svm_lasso_auc <- tune::collect_predictions(x = svm_lasso_res, parameters = svm_lasso_best) %>% 
-  yardstick::roc_curve(class, .pred_positive) %>% 
-  dplyr::mutate(model = "Lasso + SVM")
-
-readr::write_tsv(
-  x = svm_lasso_auc, file = here::here("data/results", "svm_lasso.auc.tsv")
-)
-
-
-## finalize the workflow with best hyperparameters
-svm_lasso_final <- svm_lasso_workflow %>% 
-  tune::finalize_workflow(svm_lasso_best)
-
-svm_lasso_holdFit <- svm_lasso_final %>% 
-  tune::last_fit(split = splits)
-
-collect_metrics(svm_lasso_holdFit) %>% 
-  readr::write_tsv(
-    file = here::here("data/results", "svm_lasso.final_prediction.tsv")
+lasso_pca_best <- fit_store_best_model(
+  tune_res = lasso_pca_res,
+  outPrefix = "lasso_pca", label = "PCA + Lasso",
+  truth_col = "class", pred_cols = ".pred_positive",
+  wf = lasso_pca_workflow, evalSplits = splits
   )
+
 ```
+
+
+#### Information gain with Lasso
+
+``` {r eval=FALSE}
+lasso_info_workflow <- workflows::workflow() %>% 
+  workflows::add_model(lasso_mod) %>% 
+  workflows::add_recipe(infogain_rec)
+
+# registerDoParallel(cores=4)  
+# cl <- makeCluster(4, type="FORK")  
+
+lasso_info_res <- lasso_info_workflow %>% 
+  tune::tune_grid(
+    resamples = folds,
+    grid = lasso_grid,
+    control = control_grid(save_pred = TRUE),
+    metrics = metric_set(roc_auc)
+  )
+
+# stopCluster(cl)
+
+# tune::collect_metrics(lasso_info_res)
+# tune::show_best(lasso_info_res)
+
+## select hyperparameters of the best performing model
+lasso_info_best <- fit_store_best_model(
+  tune_res = lasso_info_res,
+  outPrefix = "lasso_info", label = "Information Gain + Lasso",
+  truth_col = "class", pred_cols = ".pred_positive",
+  wf = lasso_info_workflow, evalSplits = splits
+  )
+
+```
+
+
+
 
 
 ### Compare and summarize results
 
 ```{r}
+files_auc <- list.files(
+  path = here::here("analysis/02_ML_models"), pattern = "*.auc.tsv", full.names = TRUE
+)
+
+auc_data <- purrr::map_dfr(
+  .x = files_auc,
+  .f = readr::read_tsv,
+  progress = FALSE, show_col_types = FALSE
+) %>% 
+  tidyr::separate(
+    col = model, into = c("fsel", "algo"), sep = " \\+ ", remove = FALSE
+  )
+
+class(auc_data) <- c("roc_df", class(auc_data))
 
 ```
 
+
+
+```{r}
+
+ggplot(
+  data = auc_data,
+  mapping = aes(x = 1 - specificity, y = sensitivity, col = algo, linetype = fsel)
+) +
+  geom_path(lwd = 1, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(name = "ML method", option = "plasma", end = .6) +
+  scale_linetype_manual(name = "Feature selection", values = c(1, 12)) +
+  pt_theme
+
+```
 
 
 
