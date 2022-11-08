@@ -140,8 +140,8 @@ lasso_pca_res <- lasso_pca_workflow %>%
 
 ## select hyperparameters of the best performing model
 lasso_pca_best <- fit_store_best_model(
-  tune_res = lasso_pca_res,
-  outPrefix = "lasso_pca", label = "PCA + Lasso",
+  tune_res = lasso_pca_res, label = "PCA + Lasso",
+  outPrefix = here::here("analysis/02_ML_models/lasso_pca"),
   truth_col = "class", pred_cols = ".pred_positive",
   wf = lasso_pca_workflow, evalSplits = splits
 )
@@ -170,8 +170,8 @@ lasso_info_res <- lasso_info_workflow %>%
 
 ## select hyperparameters of the best performing model
 lasso_info_best <- fit_store_best_model(
-  tune_res = lasso_info_res,
-  outPrefix = "lasso_info", label = "Information Gain + Lasso",
+  tune_res = lasso_info_res, label = "Information Gain + Lasso",
+  outPrefix = here::here("analysis/02_ML_models/lasso_info"),
   truth_col = "class", pred_cols = ".pred_positive",
   wf = lasso_info_workflow, evalSplits = splits
 )

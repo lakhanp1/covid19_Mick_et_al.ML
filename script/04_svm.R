@@ -149,8 +149,8 @@ svm_pca_res <- svm_pca_workflow %>%
 
 ## select hyperparameters of the best performing model
 svm_pca_best <- fit_store_best_model(
-  tune_res = svm_pca_res,
-  outPrefix = "svm_pca", label = "PCA + SVM",
+  tune_res = svm_pca_res, label = "PCA + SVM",
+  outPrefix = here::here("analysis/02_ML_models/svm_pca"),
   truth_col = "class", pred_cols = ".pred_positive",
   wf = svm_pca_workflow, evalSplits = splits
 )
@@ -175,8 +175,8 @@ svm_info_res <- svm_info_workflow %>%
 
 ## select hyperparameters of the best performing model
 svm_info_best <- fit_store_best_model(
-  tune_res = svm_info_res,
-  outPrefix = "svm_info", label = "Information Gain + SVM",
+  tune_res = svm_info_res, label = "Information Gain + SVM",
+  outPrefix = here::here("analysis/02_ML_models/svm_info"),
   truth_col = "class", pred_cols = ".pred_positive",
   wf = svm_info_workflow, evalSplits = splits
 )

@@ -145,8 +145,8 @@ rf_pca_res <- rf_pca_workflow %>%
 
 ## select hyperparameters of the best performing model
 rf_pca_best <- fit_store_best_model(
-  tune_res = rf_pca_res,
-  outPrefix = "rf_pca", label = "PCA + Random Forest",
+  tune_res = rf_pca_res, label = "PCA + Random Forest",
+  outPrefix = here::here("analysis/02_ML_models/rf_pca"),
   truth_col = "class", pred_cols = ".pred_positive",
   wf = rf_pca_workflow, evalSplits = splits
 )
@@ -176,8 +176,8 @@ rf_info_res <- rf_info_workflow %>%
 
 ## select hyperparameters of the best performing model
 rf_info_best <- fit_store_best_model(
-  tune_res = rf_info_res,
-  outPrefix = "rf_info", label = "Information Gain + Random Forest",
+  tune_res = rf_info_res, label = "Information Gain + Random Forest",
+  outPrefix = here::here("analysis/02_ML_models/rf_info"),
   truth_col = "class", pred_cols = ".pred_positive",
   wf = rf_info_workflow, evalSplits = splits
 )
