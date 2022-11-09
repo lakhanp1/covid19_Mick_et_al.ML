@@ -1,0 +1,2 @@
+mtry	min_n	.metric	.estimator	mean	n	std_err	.config
+10	2	roc_auc	binary	0.959348516120962	4	0.02119971081993815	Preprocessor1_Model05

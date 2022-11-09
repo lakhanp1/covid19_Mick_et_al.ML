@@ -1,0 +1,2 @@
+cost	rbf_sigma	.metric	.estimator	mean	n	std_err	.config
+32	0.0031622776601683794	roc_auc	binary	0.9758473724417998	4	0.006704210540301968	Preprocessor1_Model20

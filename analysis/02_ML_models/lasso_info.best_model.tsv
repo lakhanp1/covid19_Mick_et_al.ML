@@ -1,0 +1,2 @@
+penalty	.metric	.estimator	mean	n	std_err	.config
+0.005994842503189421	roc_auc	binary	0.9622619382681302	4	0.00484114560626456	Preprocessor1_Model08
