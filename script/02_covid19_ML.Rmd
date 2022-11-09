@@ -5,6 +5,13 @@ output: html_document
 date: "Last compiled on `r format(Sys.time(), '%d %B, %Y')`"
 ---
 
+Eran et. al. examined the transcriptional response among patients with acute respiratory illness (ARI) to identify gene expression signatures unique to COVID-19 infection. For this study, upper airway transcriptional data was collected from COVID-19 infected patients (n=93) and other patients with viral (n=43) or non-viral (n=100) ARI. The authors built a machine learning model by employing a combination of lasso regularized regression and random forest. They identified 27 gene signatures that classified the COVID-19 infected patients from other ARIs with an area under the receiver operating characteristic curve (AUROC) of 0.98.
+
+I have explored this transcriptomics data using principal component analysis (PCA). Subsequently, I applied multiple combinations of feature selection and machine learning (ML) algorithms on this data and compared these results with Eran et. al.
+
+This analysis was performed using R and all the scripts are available on GitHub page https://github.com/lakhanp1/covid19_Mick_et_al.ML. PCA exploration of data was performed using `factoextra` and `FactoMineR` packages. `tidymodels`, a framework based on `tidyverse` principles was used for ML analysis. This notebook describes the analysis steps for this ML task.
+
+
 ```{r setup}
 knitr::opts_chunk$set(
   echo = TRUE, results = 'markup', warning = FALSE, strip.white = TRUE
@@ -23,6 +30,7 @@ suppressPackageStartupMessages(library(FactoMineR))
 suppressPackageStartupMessages(library(recipeselectors))
 suppressPackageStartupMessages(library(FSelectorRcpp))
 suppressPackageStartupMessages(library(doParallel))
+suppressPackageStartupMessages(library(nomnoml))
 
 
 rm(list = ls())
@@ -145,21 +153,7 @@ countMat <- dplyr::select(covidData, -class, -!!metadataCols) %>%
 
 rownames(countMat) <- covidData$sampleId
 
-## rlog transformation is very time consuming
-# dds <- DESeq2::DESeqDataSetFromMatrix(
-#     countData = as.matrix(t(countMat)),
-#     colData = sampleInfo,
-#     design = ~1
-#   )
-# 
-# ## r-log normalized counts
-# rld <- rlog(dds, blind = FALSE)
-# rldCount <- rownames_to_column(as.data.frame(assay(rld)), var = "geneId")
-#
-
 normCountMat <- DESeq2::varianceStabilizingTransformation(t(countMat))
-
-
 ```
 
 ### Exploring data using PCA
@@ -227,9 +221,7 @@ as.data.frame(eig.val) %>%
   pt_theme
 ```
 
-
-Projection of samples on PC1 and PC2 does not result into clear clustering of samples
-with respect viral status.
+Projection of samples on PC1 and PC2 does not result into clear clustering of the patients with respect viral status.
 
 ```{r}
 factoextra::fviz_pca_ind(
@@ -260,26 +252,35 @@ pairs(
 )
 ```
 
-Based on the above results, unsupervised linear feature extraction using PCA is
-not sufficient to cluster the samples into different categories. In next steps,
-we will attempt to use the PCA as one of the feature extraction methods for building
-prediction model.
-
-
-
+Based on the above results, unsupervised linear feature extraction using PCA is not sufficient to cluster the samples into different categories. However, a ML algorithm can still use the features from PCA to identify a non-linear decision boundry in two classes. In the next steps, we will attempt to use the PCA as one of the feature extraction methods for building prediction model.
 
 ## Machine Learning setup
 
-
 ### Data processing flowchart
 
-```{r}
-## use nomnoml package to show UML
+Figure below explains the ML workflow.
+
+```{nomnoml fig.height=3, fig.width=8, out.width="100%"}
+#stroke: orange
+#fontSize: 18
+#lineWidth: 4
+[raw counts]->80%[modelling]
+[raw counts]->20%[holdout]
+[modelling]->[Cross Validation]
+[Cross Validation|fold1|fold2|fold3|fold5|fold5]->[DESeq2::vst() normalization]
+[DESeq2::vst() normalization]->[PCA]
+[DESeq2::vst() normalization]->[Information gain]
+[PCA]->[ML | Random Forest | SVM | Lasso]
+[Information gain]->[ML | Random Forest | SVM | Lasso]
+[ML]->[optimized model]
+[optimized model]->[holdout]
+[holdout]->[final evaluation]
+
 ```
 
 ### Data splitting and resampling
 
-20% data is held outside and 80% data will be used for modelling purpose using 5
+20% data is hold outside and 80% data will be used for modelling purpose using 5
 fold crossvalidation. This holdout dataset will be used to evaluate the final
 optimized model. Optimized models of multiple learners will be evaluated against
 this holdout set to select the best performing learner.
@@ -301,18 +302,10 @@ folds <- rsample::vfold_cv(
 
 ### Variance stalilizing transformation (VST) from DESeq2 package as a recipe
 
-The gene expression raw counts will be normalized using variance stabilizing 
-transformation (VST) methods of `DESeq2` package. This transformation will result
-into library size normalized count matrix with constant variance along the range
-of mean values. VST transformation will be applied to the training set. Dispersion
-estimates for Negative Binomial distributed training data will be calculated using
-`DESeq2::estimateDispersions()` function and these dispersions will be applied to
-the test data. Please refer to `DESeq2` manual for additional details.
+Gene expression raw counts will be normalized using variance stabilizing transformation (VST) methods of `DESeq2` package. This transformation will result into library size normalized count matrix with constant variance along the range of mean values. During cross-validation step, VST transformation will be applied to the training set. Dispersion estimates for Negative Binomial distributed training data will be calculated using `DESeq2::estimateDispersions()` function and these dispersions will be applied to the test data. Please refer to `DESeq2` manual for additional details.
 
 
-To process the training data for each fold and its respective test fold, we will
-build a custom VST normalization recipe. The following code block constructs
-`step_deseq2_vst` recipe. This recipe will be integrated in ML modelling workflow.
+To process the training data for each fold and its respective test fold, we will build a custom VST normalization recipe. The following code block constructs `step_deseq2_vst` recipe. This recipe will be integrated in ML modelling workflow.
 
 ```{r}
 ## Create the function
@@ -479,9 +472,7 @@ rec_vst <- recipes::recipe(x = dataModelling) %>%
 # cooked_rcp <- check_if_recipe_cooks(rcp = rec_vst)
 ```
 
-We will use two feature selection methods, **information gain** and **glmnet** and
-one feature extraction method, **PCA**. `rec_vst` recipe will be extended to include
-the feature selection step for each of these methods.
+We will use one feature selection method, **information gain** and feature extraction method **PCA** for selecting best features for modelling. `rec_vst` recipe will be extended to include the feature selection step for each of these methods.
 
 #### Feature selection recipe: information gain
 
@@ -501,7 +492,7 @@ infogain_rec <- rec_vst %>%
 
 #### Feature extraction recipe: PCA
 
-PCA will used to extract features and principal components explaining 80% variance
+PCA will be used to extract features and principal components cumulatively explaining 80% variance
 will be used as features in the subsequent ML modelling step.
 
 ```{r}
@@ -557,9 +548,9 @@ fit_store_best_model <- function(
 ```
 
 
-In the next steps, we will select the model and engine for prediction task. We will
-be applying three ML methods on our data; Random Forests, Support Vector Machines
-and Gradient Boost and select the best method after performance evaluation.
+In the next steps, we will select the model and ML engine for prediction task. We will
+be applying three ML methods on our data; **Random Forest**, **Support Vector Machines**
+and **Logistic Regression with LASSO** and select the best method after performance evaluation.
 
 ### Random Forest
 
@@ -581,6 +572,7 @@ rf_grid <- dials::grid_regular(
   levels = 5
 )
 
+rf_mod
 ```
 
 #### PCA with Random Forest
@@ -591,8 +583,6 @@ rf_pca_workflow <- workflows::workflow() %>%
   workflows::add_model(rf_mod) %>% 
   workflows::add_recipe(pca_rec)
 
-# doParallel::registerDoParallel(cores = 4)
-
 rf_pca_res <- rf_pca_workflow %>% 
   tune::tune_grid(
     resamples = folds,
@@ -600,8 +590,6 @@ rf_pca_res <- rf_pca_workflow %>%
     control = control_grid(save_pred = TRUE),
     metrics = metric_set(roc_auc)
   )
-
-# stopImplicitCluster()
 
 # tune::collect_metrics(rf_pca_res)
 # tune::show_best(rf_pca_res)
@@ -624,9 +612,6 @@ rf_info_workflow <- workflows::workflow() %>%
   workflows::add_model(rf_mod) %>% 
   workflows::add_recipe(infogain_rec)
 
-# registerDoParallel(cores=4)  
-# cl <- makeCluster(4, type="FORK")  
-
 rf_info_res <- rf_info_workflow %>% 
   tune::tune_grid(
     resamples = folds,
@@ -634,8 +619,6 @@ rf_info_res <- rf_info_workflow %>%
     control = control_grid(save_pred = TRUE),
     metrics = metric_set(roc_auc)
   )
-
-# stopCluster(cl)
 
 # tune::collect_metrics(rf_info_res)
 # tune::show_best(rf_info_res)
@@ -668,6 +651,7 @@ svm_grid <- dials::grid_regular(
   levels = 5
 )
 
+svm_mod
 ```
 
 #### PCA with SVM
@@ -678,8 +662,6 @@ svm_pca_workflow <- workflows::workflow() %>%
   workflows::add_model(svm_mod) %>% 
   workflows::add_recipe(pca_rec)
 
-# doParallel::registerDoParallel(cores = 4)
-
 svm_pca_res <- svm_pca_workflow %>% 
   tune::tune_grid(
     resamples = folds,
@@ -687,8 +669,6 @@ svm_pca_res <- svm_pca_workflow %>%
     control = control_grid(save_pred = TRUE),
     metrics = metric_set(roc_auc)
   )
-
-# stopImplicitCluster()
 
 # tune::collect_metrics(svm_pca_res)
 # tune::show_best(svm_pca_res)
@@ -748,6 +728,8 @@ lasso_grid <- dials::grid_regular(
   dials::penalty(),
   levels = 10
 )
+
+lasso_mod
 ```
 
 
@@ -758,8 +740,6 @@ lasso_pca_workflow <- workflows::workflow() %>%
   workflows::add_model(lasso_mod) %>% 
   workflows::add_recipe(pca_rec)
 
-# doParallel::registerDoParallel(cores = 4)
-
 lasso_pca_res <- lasso_pca_workflow %>% 
   tune::tune_grid(
     resamples = folds,
@@ -767,8 +747,6 @@ lasso_pca_res <- lasso_pca_workflow %>%
     control = control_grid(save_pred = TRUE),
     metrics = metric_set(roc_auc)
   )
-
-# stopImplicitCluster()
 
 # tune::collect_metrics(lasso_pca_res)
 # tune::show_best(lasso_pca_res)
@@ -791,8 +769,6 @@ lasso_info_workflow <- workflows::workflow() %>%
   workflows::add_model(lasso_mod) %>% 
   workflows::add_recipe(infogain_rec)
 
-# registerDoParallel(cores=4)  
-# cl <- makeCluster(4, type="FORK")  
 
 lasso_info_res <- lasso_info_workflow %>% 
   tune::tune_grid(
@@ -801,8 +777,6 @@ lasso_info_res <- lasso_info_workflow %>%
     control = control_grid(save_pred = TRUE),
     metrics = metric_set(roc_auc)
   )
-
-# stopCluster(cl)
 
 # tune::collect_metrics(lasso_info_res)
 # tune::show_best(lasso_info_res)
@@ -818,12 +792,53 @@ lasso_info_best <- fit_store_best_model(
 ```
 
 
-
-
-
 ### Compare and summarize results
 
-```{r}
+#### Cross validation performance
+
+```{r echo=FALSE}
+## compile best model summary during tuning
+files_cv_res <- tibble::tibble(
+  files = list.files(
+    path = here::here("analysis/02_ML_models"),
+    pattern = "*.best_model.tsv", full.names = TRUE
+  )
+) %>% 
+  dplyr::mutate(
+    id = stringr::str_replace(
+      string = basename(files), pattern = ".best_model.tsv", replacement = "")
+  ) %>% 
+  purrr::pmap_dfr(
+    # .x = files, .y = id,
+    .f = function(files, id){
+      readr::read_tsv(file = files, progress = FALSE, show_col_types = FALSE) %>% 
+        dplyr::select(.metric, .estimator, mean, n, std_err) %>%
+        dplyr::mutate(id = id)
+    }
+  ) %>% 
+  tidyr::separate(col = id, into = c("algo", "fsel"), sep = "_") %>% 
+  dplyr::mutate(
+    algo = dplyr::case_when(
+      algo == "lasso" ~ "LASSO",
+      algo == "rf" ~ "Random Forest",
+      algo == "svm" ~ "SVM"
+    ),
+    fsel = dplyr::case_when(
+      fsel == "info" ~ "Information Gain",
+      fsel == "pca" ~ "PCA"
+    )
+  ) %>% 
+  dplyr::select(fsel, algo, metric = .metric, mean, std_err) %>% 
+  dplyr::arrange(desc(mean))
+
+files_cv_res
+```
+
+Table above shows the mean 5-fold cross-validation AUC for various ML modelling combinations. Standard error for all models build on information gain selected features is lower compared to PCA feature extration. AUC for information gain based models consistently performs better than their counterparts built using PCA. SVM and Logistic Regression using Lasso are the best performing models with low standard error.
+
+
+```{r echo=FALSE}
+## compile AUC data
 files_auc <- list.files(
   path = here::here("analysis/02_ML_models"), pattern = "*.auc.tsv", full.names = TRUE
 )
@@ -839,11 +854,6 @@ auc_data <- purrr::map_dfr(
 
 class(auc_data) <- c("roc_df", class(auc_data))
 
-```
-
-
-
-```{r}
 
 ggplot(
   data = auc_data,
@@ -858,7 +868,54 @@ ggplot(
 
 ```
 
+Figure above shows the AUC for all 6 modelling combinations and confirms the results. 
+
+#### Final evaluation on hold-out data
+
+Eran et. al. built and evaluated their classification model using 5-fold cross validation. However, an independent evaluation using hold-out dataset was not performed. In our case, two feature selection/extraction methods were combined with three ML methods. All of these modelling combinations were optimized on same cross-validation dataset. As a final step, the best performing model from each of the combinations is evaluated on the hold-out dataset.
+
+```{r echo=FALSE}
+## compile final model fit metric
+final_fit <- tibble::tibble(
+  files = list.files(
+    path = here::here("analysis/02_ML_models"),
+    pattern = "*.final_prediction.tsv", full.names = TRUE
+  )
+) %>% 
+  dplyr::mutate(
+    id = stringr::str_replace(
+      string = basename(files), pattern = ".final_prediction.tsv", replacement = "")
+  ) %>% 
+  purrr::pmap_dfr(
+    # .x = files, .y = id,
+    .f = function(files, id){
+      readr::read_tsv(file = files, progress = FALSE, show_col_types = FALSE) %>% 
+        dplyr::mutate(id = id)
+    }
+  ) %>% 
+  dplyr::select(-.estimator, -.config) %>% 
+  tidyr::pivot_wider(
+    names_from = ".metric",
+    values_from = ".estimate"
+  ) %>% 
+  tidyr::separate(col = id, into = c("algo", "fsel"), sep = "_") %>% 
+  dplyr::mutate(
+    algo = dplyr::case_when(
+      algo == "lasso" ~ "LASSO",
+      algo == "rf" ~ "Random Forest",
+      algo == "svm" ~ "SVM"
+    ),
+    fsel = dplyr::case_when(
+      fsel == "info" ~ "Information Gain",
+      fsel == "pca" ~ "PCA"
+    )
+  ) %>% 
+  dplyr::arrange(desc(roc_auc))
+
+final_fit
+```
+
+Interestingly, PCA feature extraction with LASSO shows best AUC. Model generated using information gain feature selection in combination with SVM was best in cross-validation results. However, this combination performed second best on the hold-out dataset.
 
 
-
-
+Overall, two models performed close to Eran et. al. model generated using combination of random forest with lasso regularized regression. 
